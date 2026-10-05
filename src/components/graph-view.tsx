@@ -12,10 +12,11 @@ type Props = {
   comparison: string;
   selected: string;
   path: string[] | null;
+  theme: "dark" | "light";
   onSelect: (address: string) => void;
 };
 
-export default function GraphView({ nodes, transfers, root, comparison, selected, path, onSelect }: Props) {
+export default function GraphView({ nodes, transfers, root, comparison, selected, path, theme, onSelect }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const graph = useRef<ForceGraphMethods | undefined>(undefined);
   const [size, setSize] = useState({ width: 780, height: 530 });
@@ -62,7 +63,7 @@ export default function GraphView({ nodes, transfers, root, comparison, selected
       width={size.width}
       height={size.height}
       graphData={data}
-      backgroundColor="#111521"
+      backgroundColor={theme === "light" ? "#f0f4ed" : "#111521"}
       cooldownTicks={100}
       linkColor={(link) => (link as { active: boolean }).active ? "#c9f791" : "rgba(132,150,185,.23)"}
       linkWidth={(link) => (link as { active: boolean }).active ? 2.7 : 1 + Math.log2((link as { count: number }).count + 1) * .35}
@@ -78,10 +79,10 @@ export default function GraphView({ nodes, transfers, root, comparison, selected
         const x = node.x || 0; const y = node.y || 0;
         ctx.beginPath(); ctx.arc(x, y, radius + 5 / globalScale, 0, 2 * Math.PI); ctx.fillStyle = `${color(id)}18`; ctx.fill();
         ctx.beginPath(); ctx.arc(x, y, radius, 0, 2 * Math.PI); ctx.fillStyle = color(id); ctx.fill();
-        ctx.beginPath(); ctx.arc(x, y, Math.max(1, radius - 2 / globalScale), 0, 2 * Math.PI); ctx.fillStyle = "#111521"; ctx.fill();
+        ctx.beginPath(); ctx.arc(x, y, Math.max(1, radius - 2 / globalScale), 0, 2 * Math.PI); ctx.fillStyle = theme === "light" ? "#f0f4ed" : "#111521"; ctx.fill();
         if (globalScale > 1.15 || id === root || id === selected || id === comparison) {
           ctx.font = `${(id === root ? 12 : 10) / globalScale}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-          ctx.textAlign = "center"; ctx.fillStyle = id === root ? "#eaffd8" : "#d8ddea";
+          ctx.textAlign = "center"; ctx.fillStyle = id === root ? (theme === "light" ? "#314b25" : "#eaffd8") : (theme === "light" ? "#344052" : "#d8ddea");
           ctx.fillText(id === root ? "ROOT  " + shortAddress(id) : shortAddress(id), x, y + radius + 15 / globalScale);
         }
       }}

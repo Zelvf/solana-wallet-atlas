@@ -13,7 +13,8 @@ export type ScanResponse = {
   transfers: Transfer[];
   signaturesChecked: number;
   hasMoreHistory: boolean;
-  rpc: "public" | "configured";
+  tradeTransactionsExcluded: number;
+  rpc: "public" | "configured" | "custom";
 };
 
 export type WalletNode = { id: string; depth: number; origin: "root" | "comparison" };

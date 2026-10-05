@@ -2,7 +2,7 @@
 
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { amountText, shortAddress, type ScanResponse, type Transfer, type WalletNode } from "@/lib/types";
 import { relationship, shortestPath } from "@/lib/graph";
 
@@ -17,6 +17,12 @@ export default function Home() {
   const [comparison, setComparison] = useState("");
   const [depth, setDepth] = useState(2);
   const [limit, setLimit] = useState(10);
+  const [excludeTrades, setExcludeTrades] = useState(true);
+  const [tradesSkipped, setTradesSkipped] = useState(0);
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [rpcMode, setRpcMode] = useState<"default" | "custom">("default");
+  const [rpcInput, setRpcInput] = useState("");
+  const [showRpc, setShowRpc] = useState(false);
   const [nodes, setNodes] = useState<WalletNode[]>([]);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [selected, setSelected] = useState("");
@@ -29,6 +35,21 @@ export default function Home() {
   const [stoppedEarly, setStoppedEarly] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
+  useEffect(() => {
+    let stored: string | null = null;
+    try { stored = localStorage.getItem("wallet-atlas-theme"); } catch { /* Theme storage can be disabled by the browser. */ }
+    const initial = stored === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = initial;
+    const frame = requestAnimationFrame(() => setTheme(initial));
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  function changeTheme(next: "dark" | "light") {
+    setTheme(next);
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("wallet-atlas-theme", next); } catch { /* The theme still changes for this page session. */ }
+  }
+
   const path = useMemo(() => root && comparison ? shortestPath(root, comparison, transfers) : null, [root, comparison, transfers]);
   const selectedPath = useMemo(() => root && selected ? shortestPath(root, selected, transfers) : null, [root, selected, transfers]);
   const selectedTransfers = useMemo(() => transfers.filter((edge) => edge.source === selected || edge.target === selected).slice(0, 8), [transfers, selected]);
@@ -37,13 +58,19 @@ export default function Home() {
   async function scan(start: string, isComparison = false) {
     const address = start.trim();
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) { setError("Enter a valid Solana wallet address."); return; }
+    const rpcUrl = rpcMode === "custom" ? rpcInput.trim() : undefined;
+    if (rpcMode === "custom") {
+      try {
+        if (new URL(rpcUrl || "").protocol !== "https:") throw new Error();
+      } catch { setError("Enter a valid HTTPS custom RPC URL."); return; }
+    }
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
     setRunning(true); setError(""); setStoppedEarly(false);
     if (!isComparison) {
       setRoot(address); setComparison(""); setCompareInput(""); setNodes([{ id: address, depth: 0, origin: "root" }]);
-      setTransfers([]); setSelected(address); setScanned(0); setSignatures(0); setSampled(0);
+      setTransfers([]); setSelected(address); setScanned(0); setSignatures(0); setSampled(0); setTradesSkipped(0);
     } else {
       setComparison(address);
       setNodes((current) => current.some((node) => node.id === address) ? current : [...current, { id: address, depth: 0, origin: "comparison" }]);
@@ -59,6 +86,7 @@ export default function Home() {
     let processed = 0;
     let checkedSignatures = isComparison ? signatures : 0;
     let sampledWallets = isComparison ? sampled : 0;
+    let excludedTrades = isComparison ? tradesSkipped : 0;
     let truncated = false;
 
     try {
@@ -68,13 +96,14 @@ export default function Home() {
         if (visited.has(item.address)) continue;
         visited.add(item.address);
         setStatus(`Scanning generation ${item.depth} · ${shortAddress(item.address)} · ${processed + 1}/${MAX_SCANNED} addresses`);
-        const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: item.address, limit }), signal: controller.signal });
+        const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: item.address, limit, excludeTrades, ...(rpcUrl ? { rpcUrl } : {}) }), signal: controller.signal });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "The scan could not continue.");
         const result = data as ScanResponse;
         checked++; processed++; checkedSignatures += result.signaturesChecked;
         if (result.hasMoreHistory) sampledWallets++;
-        setScanned(checked); setSignatures(checkedSignatures); setSampled(sampledWallets);
+        excludedTrades += result.tradeTransactionsExcluded;
+        setScanned(checked); setSignatures(checkedSignatures); setSampled(sampledWallets); setTradesSkipped(excludedTrades);
         for (const edge of result.transfers) {
           const key = `${edge.signature}:${edge.source}:${edge.target}:${edge.asset}:${edge.amount}`;
           const other = edge.source === item.address ? edge.target : edge.source;
@@ -91,7 +120,7 @@ export default function Home() {
       }
       if (controller.signal.aborted) setStatus("Scan stopped. The graph shows only what was fetched.");
       else if (processed >= MAX_SCANNED || truncated) { setStoppedEarly(true); setStatus("Scan reached its address budget. Results are partial."); }
-      else setStatus(`Scan complete for this bounded search · ${processed} addresses checked`);
+      else setStatus(`Scan complete · ${processed} addresses checked · ${excludedTrades} trade-like transactions skipped · ${rpcUrl ? "custom RPC" : "default RPC"}`);
     } catch (caught) {
       if (controller.signal.aborted) setStatus("Scan stopped. The graph shows only what was fetched.");
       else { setError(caught instanceof Error ? caught.message : "Scan failed."); setStatus("Scan interrupted. Results are partial."); setStoppedEarly(true); }
@@ -103,18 +132,18 @@ export default function Home() {
   const canCompare = Boolean(root);
 
   return <main>
-    <header className="topbar"><Link className="brand" href="/"><span className="brand-mark">◉</span><span>WALLET<span className="brand-light">ATLAS</span></span></Link><div className="top-right"><span className="live-dot" /> MAINNET <span className="nav-separator">/</span> TRANSFER GRAPH</div></header>
+    <header className="topbar"><Link className="brand" href="/"><span className="brand-mark">◉</span><span>WALLET<span className="brand-light">ATLAS</span></span></Link><div className="topbar-actions"><div className="top-right"><span className="live-dot" /> MAINNET <span className="nav-separator">/</span> TRANSFER GRAPH</div><button className="theme-toggle" type="button" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => changeTheme(theme === "dark" ? "light" : "dark")}><span>{theme === "dark" ? "☼" : "◐"}</span><small>{theme === "dark" ? "LIGHT" : "DARK"}</small></button></div></header>
 
     <div className="shell">
       <section className="intro"><div className="intro-main"><div className="kicker"><span className="kicker-line" /> ONCHAIN INTELLIGENCE <span className="kicker-index">01 / 03</span></div><h1>Every transfer<br /><em>tells a story.</em></h1><p>Trace SOL and token transfers across connected addresses. Follow the path, compare wallets, and see how many hops separate them.</p></div><div className="intro-aside"><span>NETWORK</span><strong>Solana<br />Mainnet</strong><div className="aside-orb">✦</div><small>Live RPC data<br />No wallet connection needed</small></div></section>
 
-      <section className="search-panel"><div className="section-label"><span className="step-number">01</span><span>START A TRACE</span><span className="section-rule" /></div><form className="search-row" onSubmit={(event) => { event.preventDefault(); scan(input); }}><div className="address-field"><span className="field-icon">⌕</span><input aria-label="Solana wallet address" value={input} onChange={(event) => setInput(event.target.value)} placeholder="Paste a Solana wallet address..." spellCheck={false} /><span className="field-tag">SOL</span></div><button className="primary-button" type="submit" disabled={running}>TRACE WALLET <span>↗</span></button></form><div className="search-options"><div className="option-group"><span>GENERATIONS</span>{[1, 2, 3].map((value) => <button className={depth === value ? "option active" : "option"} key={value} onClick={() => setDepth(value)} disabled={running}>{value} {value === 1 ? "hop" : "hops"}</button>)}</div><div className="option-group"><span>RECENT TX / ADDRESS</span><select aria-label="Recent transactions per address" value={limit} onChange={(event) => setLimit(Number(event.target.value))} disabled={running}><option value={5}>5 transactions</option><option value={10}>10 transactions</option><option value={25}>25 transactions</option></select></div><span className="limit-note">Up to {MAX_SCANNED} scanned · {MAX_NODES} shown</span></div></section>
+      <section className="search-panel"><div className="section-label"><span className="step-number">01</span><span>START A TRACE</span><span className="section-rule" /></div><form className="search-row" onSubmit={(event) => { event.preventDefault(); scan(input); }}><div className="address-field"><span className="field-icon">⌕</span><input aria-label="Solana wallet address" value={input} onChange={(event) => setInput(event.target.value)} placeholder="Paste a Solana wallet address..." spellCheck={false} /><span className="field-tag">SOL</span></div><button className="primary-button" type="submit" disabled={running}>TRACE WALLET <span>↗</span></button></form><div className="search-options"><div className="depth-control"><label htmlFor="scan-depth"><span>SCAN DEPTH</span><strong>{depth} <small>{depth === 1 ? "HOP" : "HOPS"}</small></strong></label><input id="scan-depth" aria-label="Scan depth in generations" type="range" min="1" max="6" value={depth} onChange={(event) => setDepth(Number(event.target.value))} disabled={running} /><div className="range-labels"><span>Direct</span><span>Extended network</span></div></div><div className="option-group"><span>RECENT TX / ADDRESS</span><select aria-label="Recent transactions per address" value={limit} onChange={(event) => setLimit(Number(event.target.value))} disabled={running}><option value={5}>5 transactions</option><option value={10}>10 transactions</option><option value={25}>25 transactions</option></select></div><span className="limit-note">Up to {MAX_SCANNED} scanned · {MAX_NODES} shown</span></div><div className="scan-filter-row"><label className="trade-toggle"><input type="checkbox" checked={excludeTrades} onChange={(event) => setExcludeTrades(event.target.checked)} disabled={running} /><span className="toggle-track"><i /></span><span><strong>Exclude token trades</strong><small>Skips likely buys and sells; keeps ordinary token transfers in and out.</small></span></label><span className="trade-count">{tradesSkipped} trade-like tx skipped</span></div><div className="rpc-settings"><div className="rpc-setting-top"><span>RPC SOURCE</span><div className="rpc-mode-switch"><button type="button" className={rpcMode === "default" ? "active" : ""} aria-pressed={rpcMode === "default"} disabled={running} onClick={() => setRpcMode("default")}>Default</button><button type="button" className={rpcMode === "custom" ? "active" : ""} aria-pressed={rpcMode === "custom"} disabled={running} onClick={() => setRpcMode("custom")}>Custom RPC</button></div></div>{rpcMode === "custom" && <div className="rpc-custom"><div className="rpc-input-wrap"><input aria-label="Custom RPC URL" type={showRpc ? "url" : "password"} value={rpcInput} onChange={(event) => setRpcInput(event.target.value)} placeholder="https://your-mainnet-rpc.example/your-key" autoComplete="off" spellCheck={false} disabled={running} /><button type="button" onClick={() => setShowRpc((value) => !value)} aria-label={showRpc ? "Hide RPC URL" : "Show RPC URL"}>{showRpc ? "HIDE" : "SHOW"}</button></div><p>HTTPS mainnet endpoints only. The URL is sent to this app&apos;s server for scans and is not saved.</p></div>}</div></section>
 
       {(error || status) && <div className={`status-bar ${error ? "status-error" : ""}`}><span className={running ? "pulse-dot" : "status-dot"} />{error || status}{running && <button onClick={stop}>STOP SCAN</button>}</div>}
 
       <section className="metrics"><div><span>ADDRESSES FOUND</span><strong>{nodes.length.toString().padStart(2, "0")}</strong><small>in visible graph</small></div><div><span>TRANSFER EVENTS</span><strong>{transfers.length.toString().padStart(2, "0")}</strong><small>SOL + SPL</small></div><div><span>ADDRESSES SCANNED</span><strong>{scanned.toString().padStart(2, "0")}</strong><small>across both traces</small></div><div><span>TRANSACTIONS CHECKED</span><strong>{signatures.toString().padStart(2, "0")}</strong><small>most recent per address</small></div></section>
 
-      <section className="workspace-grid"><div className="graph-card"><div className="card-heading"><div><div className="section-label"><span className="step-number">02</span><span>NETWORK MAP</span></div><h2>Connection graph</h2></div><span className="card-hint">DRAG TO EXPLORE · SCROLL TO ZOOM</span></div><GraphView nodes={nodes} transfers={transfers} root={root} comparison={comparison} selected={selected} path={currentPath} onSelect={setSelected} /><div className="graph-footer"><div><span className="legend-dot root-color" /> Root address</div><div><span className="legend-dot compare-color" /> Comparison</div><div><span className="legend-dot wallet-color" /> Connected address</div><span className="graph-count">{nodes.length} NODES / {transfers.length} EVENTS</span></div></div>
+      <section className="workspace-grid"><div className="graph-card"><div className="card-heading"><div><div className="section-label"><span className="step-number">02</span><span>NETWORK MAP</span></div><h2>Connection graph</h2></div><span className="card-hint">DRAG TO EXPLORE · SCROLL TO ZOOM</span></div><GraphView nodes={nodes} transfers={transfers} root={root} comparison={comparison} selected={selected} path={currentPath} theme={theme} onSelect={setSelected} /><div className="graph-footer"><div><span className="legend-dot root-color" /> Root address</div><div><span className="legend-dot compare-color" /> Comparison</div><div><span className="legend-dot wallet-color" /> Connected address</div><span className="graph-count">{nodes.length} NODES / {transfers.length} EVENTS</span></div></div>
 
       <div className="side-stack"><div className="compare-card"><div className="section-label"><span className="step-number">03</span><span>COMPARE WALLETS</span></div><h2>Are they connected?</h2><p>Enter a second address to reveal the shortest observed transfer path.</p><form onSubmit={(event) => { event.preventDefault(); if (canCompare) { setComparison(compareInput.trim()); if (!nodes.some((node) => node.id === compareInput.trim())) scan(compareInput, true); } }}><input aria-label="Compare wallet address" value={compareInput} onChange={(event) => setCompareInput(event.target.value)} placeholder="Second wallet address" disabled={!canCompare || running} spellCheck={false} /><button disabled={!canCompare || running || !compareInput.trim()} type="submit">FIND CONNECTION <span>↗</span></button></form>{!canCompare && <div className="muted-note">Trace the first wallet to enable comparison.</div>}{comparison && <div className="comparison-result"><span className="result-label">RELATIONSHIP RESULT</span>{path ? <><strong className="connected">● CONNECTED</strong><div className="result-title">{relationship(path, transfers)}</div><div className="path-line">{path.map((address, index) => <span key={`${address}-${index}`}>{index > 0 && <b>→</b>}<button onClick={() => setSelected(address)}>{shortAddress(address)}</button></span>)}</div><small>{path.length - 1} {path.length === 2 ? "transfer hop" : "transfer hops"} in the observed graph. Arrows above show path order; transfer direction is shown in the label.</small></> : <><strong className="unconnected">○ NO PATH FOUND</strong><small>These addresses were not linked in the transactions scanned. This is not proof that no link exists.</small></>}</div>}</div>
 
