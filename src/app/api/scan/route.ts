@@ -15,7 +15,7 @@ function validAddress(address: unknown): address is string {
 
 const MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
-async function rpcPayload(body: string, custom?: CustomRpcTarget): Promise<unknown> {
+async function rpcPayload(body: string, custom?: CustomRpcTarget, operation = "request"): Promise<unknown> {
   const endpoint = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
   let status: number;
   let responseText: string;
@@ -58,8 +58,8 @@ async function rpcPayload(body: string, custom?: CustomRpcTarget): Promise<unkno
     if (custom) for (const secret of custom.url.searchParams.values()) if (secret) excerpt = excerpt.split(secret).join("[redacted]");
     return excerpt;
   };
-  if (status === 429) throw new Error(`${provider} rate limit remained after 3 retries (HTTP 429). Reduce the transactions per address, wait for the provider's quota window to reset, or check your Helius plan limits.`);
-  if (status === 503) throw new Error(`${provider} is temporarily unavailable (HTTP 503) after 3 retries. Try again shortly.`);
+  if (status === 429) throw new Error(`${provider} ${operation} rate limit remained after 3 retries (HTTP 429)${retryAfter ? `; provider Retry-After: ${retryAfter}` : ""}. Reduce transactions per address, wait for the quota window, or check your Helius plan limits.`);
+  if (status === 503) throw new Error(`${provider} ${operation} is temporarily unavailable (HTTP 503) after 3 retries. Try again shortly.`);
   if (status < 200 || status >= 300) {
     try {
       const errorMessage = getRpcError(JSON.parse(responseText));
@@ -86,7 +86,7 @@ function getRpcError(value: unknown): string | null {
 }
 
 async function rpc<T>(method: string, params: unknown[], custom?: CustomRpcTarget): Promise<T> {
-  const json = await rpcPayload(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), custom);
+  const json = await rpcPayload(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), custom, method);
   const error = getRpcError(json);
   if (error) throw new Error(`${custom ? "Custom RPC" : "Solana RPC"}: ${error}`);
   if (!json || typeof json !== "object" || !("result" in json)) throw new Error("RPC returned an invalid JSON-RPC response.");
@@ -94,13 +94,19 @@ async function rpc<T>(method: string, params: unknown[], custom?: CustomRpcTarge
 }
 
 async function rpcBatch<T>(calls: { id: string; method: string; params: unknown[] }[], custom: CustomRpcTarget): Promise<Map<string, T>> {
-  const json = await rpcPayload(JSON.stringify(calls.map((call) => ({ jsonrpc: "2.0", ...call }))), custom);
-  if (!Array.isArray(json)) throw new Error("This RPC does not support batched transaction requests. Lower the transaction limit or use another RPC.");
   const results = new Map<string, T>();
-  for (const item of json) {
-    const error = getRpcError(item);
-    if (error) throw new Error(`Custom RPC: ${error}`);
-    if (item && typeof item === "object" && "id" in item && "result" in item) results.set(String(item.id), item.result as T);
+  for (let index = 0; index < calls.length; index += 10) {
+    // Helius Free is limited to 10 RPC calls/s. Space 10-item historical batches
+    // so a 500-signature scan does not burst all its calls at once.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const batch = calls.slice(index, index + 10);
+    const json = await rpcPayload(JSON.stringify(batch.map((call) => ({ jsonrpc: "2.0", ...call }))), custom, "getTransaction batch");
+    if (!Array.isArray(json)) throw new Error("This RPC does not support batched transaction requests. Lower the transaction limit or use another RPC.");
+    for (const item of json) {
+      const error = getRpcError(item);
+      if (error) throw new Error(`Custom RPC getTransaction batch: ${error}`);
+      if (item && typeof item === "object" && "id" in item && "result" in item) results.set(String(item.id), item.result as T);
+    }
   }
   return results;
 }
@@ -124,7 +130,7 @@ export async function POST(request: NextRequest) {
     const results: Transfer[] = [];
     let tradeTransactionsExcluded = 0;
     const heliusRpc = custom?.url.hostname.endsWith("helius-rpc.com") ?? false;
-    const batchSize = heliusRpc ? 100 : 3;
+    const batchSize = heliusRpc ? 500 : 3;
     for (let index = 0; index < successful.length; index += batchSize) {
       const batch = successful.slice(index, index + batchSize);
       const transactions = heliusRpc && custom
