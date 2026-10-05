@@ -1,6 +1,6 @@
 # Wallet Atlas
 
-Wallet Atlas traces **observed SOL and SPL token transfers** from a Solana address and draws a graph of connected addresses. Paste a second address to find the shortest transfer path in the graph. “Parent” means an address sent assets to the selected address; “child” means it received assets. These labels do not imply identity or shared ownership.
+Wallet Atlas traces **observed SOL and SPL token transfers** from a Solana address and draws a graph of connected addresses. Paste a second address to highlight every shortest observed route between the two wallets. The comparison result lists every transfer event on those routes with its amount and a Solscan transaction link. “Parent” means an address sent assets to the selected address; “child” means it received assets. These labels do not imply identity or shared ownership.
 
 ## Run locally
 

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ForceGraph2D, { type ForceGraphMethods } from "react-force-graph-2d";
 import type { Transfer, WalletNode } from "@/lib/types";
 import { shortAddress } from "@/lib/types";
+import { connectionKey } from "@/lib/graph";
 
 type Props = {
   nodes: WalletNode[];
@@ -12,11 +13,12 @@ type Props = {
   comparison: string;
   selected: string;
   path: string[] | null;
+  pathEdges: string[];
   theme: "dark" | "light";
   onSelect: (address: string) => void;
 };
 
-export default function GraphView({ nodes, transfers, root, comparison, selected, path, theme, onSelect }: Props) {
+export default function GraphView({ nodes, transfers, root, comparison, selected, path, pathEdges, theme, onSelect }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const graph = useRef<ForceGraphMethods | undefined>(undefined);
   const [size, setSize] = useState({ width: 780, height: 530 });
@@ -29,18 +31,18 @@ export default function GraphView({ nodes, transfers, root, comparison, selected
   }, []);
 
   const highlighted = useMemo(() => new Set(path || []), [path]);
+  const highlightedEdges = useMemo(() => new Set(pathEdges), [pathEdges]);
   const data = useMemo(() => {
     const unique = new Map<string, { source: string; target: string; count: number; active: boolean }>();
     for (const transfer of transfers) {
-      const key = [transfer.source, transfer.target].sort().join(":");
+      const key = connectionKey(transfer.source, transfer.target);
       const current = unique.get(key);
-      const active = Boolean(path?.some((address, index) => index < path.length - 1 &&
-        ((address === transfer.source && path[index + 1] === transfer.target) || (address === transfer.target && path[index + 1] === transfer.source))));
+      const active = highlightedEdges.has(key);
       if (current) { current.count++; current.active ||= active; }
       else unique.set(key, { source: transfer.source, target: transfer.target, count: 1, active });
     }
     return { nodes: nodes.map((node) => ({ ...node })), links: [...unique.values()] };
-  }, [nodes, transfers, path]);
+  }, [nodes, transfers, highlightedEdges]);
 
   useEffect(() => {
     if (!graph.current || !nodes.length) return;
