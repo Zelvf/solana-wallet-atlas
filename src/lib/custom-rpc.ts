@@ -46,7 +46,7 @@ export async function resolveCustomRpc(input: unknown): Promise<CustomRpcTarget>
   return { url, ip: addresses[0].address };
 }
 
-export async function postCustomRpc(target: CustomRpcTarget, body: string): Promise<{ status: number; json: unknown }> {
+export async function postCustomRpc(target: CustomRpcTarget, body: string): Promise<{ status: number; contentType: string; text: string }> {
   return new Promise((resolve, reject) => {
     const outgoing = request(target.url, {
       method: "POST",
@@ -69,8 +69,11 @@ export async function postCustomRpc(target: CustomRpcTarget, body: string): Prom
         chunks.push(chunk);
       });
       response.on("end", () => {
-        try { resolve({ status: response.statusCode || 502, json: JSON.parse(Buffer.concat(chunks).toString("utf8")) }); }
-        catch { reject(new Error("Custom RPC returned invalid JSON.")); }
+        resolve({
+          status: response.statusCode || 502,
+          contentType: response.headers["content-type"] || "unknown content type",
+          text: Buffer.concat(chunks).toString("utf8"),
+        });
       });
     });
     outgoing.on("timeout", () => outgoing.destroy(new Error("Custom RPC timed out.")));
