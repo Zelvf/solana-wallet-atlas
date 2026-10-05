@@ -46,7 +46,7 @@ export async function resolveCustomRpc(input: unknown): Promise<CustomRpcTarget>
   return { url, ip: addresses[0].address };
 }
 
-export async function postCustomRpc(target: CustomRpcTarget, body: string): Promise<{ status: number; contentType: string; text: string }> {
+export async function postCustomRpc(target: CustomRpcTarget, body: string): Promise<{ status: number; contentType: string; retryAfter: string | undefined; text: string }> {
   return new Promise((resolve, reject) => {
     const outgoing = request(target.url, {
       method: "POST",
@@ -72,6 +72,7 @@ export async function postCustomRpc(target: CustomRpcTarget, body: string): Prom
         resolve({
           status: response.statusCode || 502,
           contentType: response.headers["content-type"] || "unknown content type",
+          retryAfter: response.headers["retry-after"],
           text: Buffer.concat(chunks).toString("utf8"),
         });
       });

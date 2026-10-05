@@ -15,29 +15,42 @@ function validAddress(address: unknown): address is string {
 
 const MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
-async function rpc<T>(method: string, params: unknown[], custom?: CustomRpcTarget): Promise<T> {
+async function rpcPayload(body: string, custom?: CustomRpcTarget): Promise<unknown> {
   const endpoint = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
-  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
   let status: number;
   let responseText: string;
   let contentType: string;
-  let json: { result?: T; error?: { message?: string } };
-  if (custom) {
-    const result = await postCustomRpc(custom, body);
-    status = result.status;
-    responseText = result.text;
-    contentType = result.contentType;
-  } else {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      cache: "no-store",
-      signal: AbortSignal.timeout(12000),
-    });
-    status = response.status;
-    responseText = await response.text();
-    contentType = response.headers.get("content-type") || "unknown content type";
+  let json: unknown;
+  let retryAfter: string | undefined;
+  for (let attempt = 0; ; attempt++) {
+    if (custom) {
+      const response = await postCustomRpc(custom, body);
+      status = response.status;
+      responseText = response.text;
+      contentType = response.contentType;
+      retryAfter = response.retryAfter;
+    } else {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        cache: "no-store",
+        signal: AbortSignal.timeout(12000),
+      });
+      status = response.status;
+      responseText = await response.text();
+      contentType = response.headers.get("content-type") || "unknown content type";
+      retryAfter = response.headers.get("retry-after") || undefined;
+    }
+    if ((status !== 429 && status !== 503) || attempt >= 3) break;
+    const retrySeconds = Number(retryAfter);
+    const retryDate = retryAfter ? Date.parse(retryAfter) : NaN;
+    const headerDelay = Number.isFinite(retrySeconds) && retrySeconds >= 0
+      ? retrySeconds * 1000
+      : Number.isFinite(retryDate) ? Math.max(0, retryDate - Date.now()) : 0;
+    const backoff = Math.min(8000, 1000 * (2 ** attempt));
+    const delay = Math.min(10000, headerDelay || backoff) + Math.round(Math.random() * 300);
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
   const provider = custom ? "Custom RPC" : "Solana RPC";
   const preview = () => {
@@ -45,23 +58,51 @@ async function rpc<T>(method: string, params: unknown[], custom?: CustomRpcTarge
     if (custom) for (const secret of custom.url.searchParams.values()) if (secret) excerpt = excerpt.split(secret).join("[redacted]");
     return excerpt;
   };
-  if (status === 429) throw new Error(`${provider} rate limit reached (HTTP 429). Retry shortly or check your provider's rate limits.`);
+  if (status === 429) throw new Error(`${provider} rate limit remained after 3 retries (HTTP 429). Reduce the transactions per address, wait for the provider's quota window to reset, or check your Helius plan limits.`);
+  if (status === 503) throw new Error(`${provider} is temporarily unavailable (HTTP 503) after 3 retries. Try again shortly.`);
   if (status < 200 || status >= 300) {
     try {
-      json = JSON.parse(responseText) as typeof json;
-      if (json.error?.message) throw new Error(`${provider} returned HTTP ${status}: ${json.error.message}`);
+      const errorMessage = getRpcError(JSON.parse(responseText));
+      if (errorMessage) throw new Error(`${provider} returned HTTP ${status}: ${errorMessage}`);
     } catch (error) {
       if (error instanceof Error && error.message.startsWith(`${provider} returned HTTP`)) throw error;
     }
     throw new Error(`${provider} returned HTTP ${status} (${contentType}). ${preview() ? `Response: ${preview()}` : "No response body."}`);
   }
   try {
-    json = JSON.parse(responseText) as typeof json;
+    json = JSON.parse(responseText) as unknown;
   } catch {
     throw new Error(`${provider} returned a non-JSON response (HTTP ${status}; ${contentType}). ${preview() ? `Response: ${preview()}` : "Check that the endpoint URL and API key are correct."}`);
   }
-  if (json.error) throw new Error(`${provider}: ${json.error.message || "request failed"}`);
+  return json;
+}
+
+function getRpcError(value: unknown): string | null {
+  if (!value || typeof value !== "object" || !("error" in value) || !value.error) return null;
+  const error = value.error;
+  return typeof error === "object" && error && "message" in error && typeof error.message === "string"
+    ? error.message
+    : "request failed";
+}
+
+async function rpc<T>(method: string, params: unknown[], custom?: CustomRpcTarget): Promise<T> {
+  const json = await rpcPayload(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), custom);
+  const error = getRpcError(json);
+  if (error) throw new Error(`${custom ? "Custom RPC" : "Solana RPC"}: ${error}`);
+  if (!json || typeof json !== "object" || !("result" in json)) throw new Error("RPC returned an invalid JSON-RPC response.");
   return json.result as T;
+}
+
+async function rpcBatch<T>(calls: { id: string; method: string; params: unknown[] }[], custom: CustomRpcTarget): Promise<Map<string, T>> {
+  const json = await rpcPayload(JSON.stringify(calls.map((call) => ({ jsonrpc: "2.0", ...call }))), custom);
+  if (!Array.isArray(json)) throw new Error("This RPC does not support batched transaction requests. Lower the transaction limit or use another RPC.");
+  const results = new Map<string, T>();
+  for (const item of json) {
+    const error = getRpcError(item);
+    if (error) throw new Error(`Custom RPC: ${error}`);
+    if (item && typeof item === "object" && "id" in item && "result" in item) results.set(String(item.id), item.result as T);
+  }
+  return results;
 }
 
 export async function POST(request: NextRequest) {
@@ -82,16 +123,26 @@ export async function POST(request: NextRequest) {
     const successful = signatures.filter((item) => !item.err);
     const results: Transfer[] = [];
     let tradeTransactionsExcluded = 0;
-    // Bound concurrent provider calls while keeping a 500-transaction scan within
-    // the function time budget when the selected provider responds promptly.
-    for (let index = 0; index < successful.length; index += 8) {
-      const batch = successful.slice(index, index + 8);
-      const transactions = await Promise.all(batch.map(async (item) => {
-        const tx = await rpc<Parameters<typeof transfersFromTransaction>[0]>("getTransaction", [item.signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 1 }], custom);
-        const parsed = transfersFromTransaction(tx, item.signature, address);
-        return excludeTrades && parsed.tradeLike ? { transfers: [], tradeLike: true } : parsed;
-      }));
-      for (const transaction of transactions) {
+    const heliusRpc = custom?.url.hostname.endsWith("helius-rpc.com") ?? false;
+    const batchSize = heliusRpc ? 100 : 3;
+    for (let index = 0; index < successful.length; index += batchSize) {
+      const batch = successful.slice(index, index + batchSize);
+      const transactions = heliusRpc && custom
+        ? await rpcBatch<Parameters<typeof transfersFromTransaction>[0]>(batch.map((item) => ({
+          id: item.signature,
+          method: "getTransaction",
+          params: [item.signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 1 }],
+        })), custom).then((bySignature) => batch.map((item) => ({
+          signature: item.signature,
+          tx: bySignature.get(item.signature) ?? null,
+        })))
+        : await Promise.all(batch.map(async (item) => ({
+          signature: item.signature,
+          tx: await rpc<Parameters<typeof transfersFromTransaction>[0]>("getTransaction", [item.signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 1 }], custom),
+        })));
+      for (const item of transactions) {
+        const parsed = transfersFromTransaction(item.tx, item.signature, address);
+        const transaction = excludeTrades && parsed.tradeLike ? { transfers: [], tradeLike: true } : parsed;
         if (transaction.tradeLike && excludeTrades) tradeTransactionsExcluded++;
         results.push(...transaction.transfers);
       }
